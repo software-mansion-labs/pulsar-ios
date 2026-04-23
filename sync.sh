@@ -1,0 +1,7 @@
+cd ../../../pulsar-ios
+cp -r ../pulsar/iOS/Pulsar/* ./
+git add .
+git commit -m "Sync iOS Pulsar files"
+git push origin main
+rm sync.sh
+cd ../pulsar/iOS/Pulsar/

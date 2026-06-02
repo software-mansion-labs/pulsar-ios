@@ -2,34 +2,23 @@ import Foundation
 import CoreHaptics
 import SwiftUI
 
-public class HapticEngineWrapper {
+public final class HapticEngineWrapper: @unchecked Sendable {
+  // `@unchecked Sendable` is justified: all stored state is mutated only on
+  // the main thread (see `setupEngineHandlers()` comment for details). The
+  // conformance lets us capture `self` into the main-actor closures used to
+  // serialize CoreHaptics callbacks back onto the main thread.
   private var engine: CHHapticEngine?
   private var initialized = false
   private(set) var isHapticsEnabled = true
-  private var isAppActive: Bool
+  private var isAppActiveCache = false
+  private var appLifecycleTrackingBootstrapped = false
   private var playerRegistry: [Int: CHHapticPatternPlayer] = [:]
   private var playerCreationOrder: [Int] = []
   private let playerLimit = 20
   private var nextPlayerId = 0
   private var cachedRealtimePlayer: CHHapticAdvancedPatternPlayer?
 
-  public init() {
-    isAppActive = UIApplication.shared.applicationState == .active
-
-    guard CHHapticEngine.capabilitiesForHardware().supportsHaptics else {
-      print("Error: Device doesn't support haptics")
-      return
-    }
-
-    do {
-      engine = try CHHapticEngine()
-      setupEngineHandlers()
-      startEngine()
-      registerAppLifecycleObservers()
-    } catch {
-      print("Error starting engine: \(error.localizedDescription)")
-    }
-  }
+  public init() {}
 
   deinit {
     if !initialized { return }
@@ -48,8 +37,11 @@ public extension HapticEngineWrapper {
 
     if !isHapticsEnabled {
       stopHaptics()
-    } else if canPlayHaptics() && !initialized {
-      startEngine()
+    } else {
+      bootstrapAppLifecycleTrackingIfNeeded()
+      if canPlayHaptics() && !initialized {
+        startEngine()
+      }
     }
   }
 
@@ -65,6 +57,7 @@ public extension HapticEngineWrapper {
   }
 
   func createPlayer(pattern: CHHapticPattern?) -> Int? {
+    bootstrapAppLifecycleTrackingIfNeeded()
     guard canPlayHaptics() else { return nil }
 
     startEngine()
@@ -74,6 +67,7 @@ public extension HapticEngineWrapper {
   }
 
   func getRealtimePlayer() -> CHHapticAdvancedPatternPlayer? {
+    bootstrapAppLifecycleTrackingIfNeeded()
     guard canPlayHaptics() else { return nil }
 
     startEngine()
@@ -87,6 +81,7 @@ public extension HapticEngineWrapper {
   }
 
   func playPlayer(id: Int, pattern: CHHapticPattern? = nil) {
+    bootstrapAppLifecycleTrackingIfNeeded()
     guard canPlayHaptics() else { return }
 
     if let player = playerRegistry[id] {
@@ -123,11 +118,15 @@ public extension HapticEngineWrapper {
 extension HapticEngineWrapper {
 
   func updatePlaybackAvailability(for state: UIApplication.State) {
-    isAppActive = state == .active
+    isAppActiveCache = state == .active
   }
 
   func canPlayHaptics() -> Bool {
-    isHapticsEnabled && isAppActive && isHapticsSupported()
+    isHapticsEnabled && isAppActive() && isHapticsSupported()
+  }
+
+  func isAppActive() -> Bool {
+    return isAppActiveCache
   }
 
   func isHapticsSupported() -> Bool {
@@ -172,7 +171,9 @@ private extension HapticEngineWrapper {
   }
 
   @objc func appWillEnterForeground() {
-    updatePlaybackAvailability(for: UIApplication.shared.applicationState)
+    // UIApplication lifecycle notifications are posted on the main thread.
+    let state = MainActor.assumeIsolated { UIApplication.shared.applicationState }
+    updatePlaybackAvailability(for: state)
   }
 
   @objc func appDidBecomeActive() {
@@ -208,6 +209,18 @@ private extension HapticEngineWrapper {
     }
   }
 
+  func bootstrapAppLifecycleTrackingIfNeeded() {
+    guard !appLifecycleTrackingBootstrapped else { return }
+    appLifecycleTrackingBootstrapped = true
+    seedAppActiveCache()
+    registerAppLifecycleObservers()
+  }
+
+  func seedAppActiveCache() {
+    let read = { MainActor.assumeIsolated { UIApplication.shared.applicationState == .active } }
+    isAppActiveCache = Thread.isMainThread ? read() : DispatchQueue.main.sync(execute: read)
+  }
+
   func createEngineIfNeeded() throws {
     guard engine == nil else { return }
 
@@ -216,17 +229,37 @@ private extension HapticEngineWrapper {
   }
 
   func setupEngineHandlers() {
+    // CoreHaptics invokes these handlers from an internal background queue.
+    // All other state in this object (engine, initialized, playerRegistry,
+    // playerCreationOrder, cachedRealtimePlayer) is read & written from the
+    // main thread — public methods run on the RN module's main methodQueue,
+    // and UIApplication.* notifications post on main. Hop the handler bodies
+    // to main so that all mutations of shared state remain serialized on a
+    // single thread; otherwise the BG handler can race with a main-thread
+    // call into createPlayer / playPlayer / stopHaptics and crash on a
+    // concurrent Dictionary mutation.
+    //
+    // Use `DispatchQueue.main.async` rather than `Task { @MainActor }` so the
+    // handler bodies stay strictly ordered FIFO with the rest of the main
+    // queue's work (e.g. RN bridge calls dispatched on `main` from
+    // `Haptics.mm`). Capturing `self` into the GCD closure is allowed under
+    // Swift 6 because the class is `@unchecked Sendable`; no actor hop is
+    // needed because the stored properties touched here are non-isolated.
     engine?.stoppedHandler = { [weak self] _ in
-      guard let self else { return }
-      self.initialized = false
-      self.clearPlayerState(stopPlayers: false)
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.initialized = false
+        self.clearPlayerState(stopPlayers: false)
+      }
     }
 
     engine?.resetHandler = { [weak self] in
-      guard let self else { return }
-      self.initialized = false
-      self.clearPlayerState(stopPlayers: false)
-      self.engine = nil
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.initialized = false
+        self.clearPlayerState(stopPlayers: false)
+        self.engine = nil
+      }
     }
   }
 }
